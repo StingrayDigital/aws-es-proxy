@@ -1,20 +1,36 @@
-FROM golang:1.14-alpine
+FROM harbor.stingray-tooling.com/docker.io-library/golang:1.17-alpine as build_modules
 
-WORKDIR /go/src/github.com/abutaha/aws-es-proxy
-COPY . .
+ENV GOPROXY=https://athens.stingray-tooling.com
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o aws-es-proxy
+WORKDIR /src
+COPY go.mod /src
+COPY go.sum /src
 
-FROM alpine:3.11
-LABEL name="aws-es-proxy" \
-      version="latest"
+RUN go mod download
 
-RUN apk --no-cache add ca-certificates
-WORKDIR /home/
-COPY --from=0 /go/src/github.com/abutaha/aws-es-proxy/aws-es-proxy /usr/local/bin/
+FROM build_modules AS build
 
-ENV PORT_NUM 9200
-EXPOSE ${PORT_NUM}
+COPY . /src
 
-ENTRYPOINT ["aws-es-proxy"] 
-CMD ["-h"]
+ENV GOOS=linux
+ENV GOARCH=amd64
+ENV CGO_ENABLED=0
+
+RUN go build -v -o aws-es-proxy .
+
+FROM harbor.stingray-tooling.com/docker.io-library/alpine:3.15
+
+RUN apk add --no-cache ca-certificates bash
+
+COPY --from=build /src/aws-es-proxy /bin/aws-es-proxy
+COPY run.sh /bin/run.sh
+
+ENV ENDPOINT ""
+ENV AWS_ACCESS_KEY_ID ""
+ENV AWS_SECRET_ACCESS_KEY ""
+ENV AWS_ROLE_ARN ""
+ENV PORT 9200
+
+EXPOSE $PORT
+
+ENTRYPOINT ["run.sh"]

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"flag"
@@ -20,12 +21,15 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/endpoints"
-	"github.com/aws/aws-sdk-go/aws/session"
-	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go/logging"
+	"golang.org/x/net/context"
+
 	"github.com/sirupsen/logrus"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"golang.org/x/net/publicsuffix"
@@ -74,7 +78,6 @@ type proxy struct {
 	scheme          string
 	host            string
 	region          string
-	service         string
 	endpoint        string
 	verbose         bool
 	prettify        bool
@@ -82,14 +85,14 @@ type proxy struct {
 	nosignreq       bool
 	fileRequest     *os.File
 	fileResponse    *os.File
-	credentials     *credentials.Credentials
+	credProvider    aws.CredentialsProvider
 	httpClient      *http.Client
 	auth            bool
 	username        string
 	password        string
 	realm           string
 	remoteTerminate bool
-	assumeRole      string
+	signer          v4.HTTPSigner
 }
 
 func newProxy(args ...interface{}) *proxy {
@@ -109,9 +112,33 @@ func newProxy(args ...interface{}) *proxy {
 		Jar:           jar,
 	}
 
+	verbose := args[1].(bool)
+
+	cfg, err := config.LoadDefaultConfig(context.TODO(), func(options *config.LoadOptions) error {
+		options.Logger = newAwsLogger()
+		options.Retryer = func() aws.Retryer {
+			return retry.NewStandard()
+		}
+		if verbose {
+			mode := aws.LogSigning | aws.LogRequest | aws.LogResponse
+			options.ClientLogMode = &mode
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// If assume role arg, add an sts cred provider
+	credprov := cfg.Credentials
+	if assumeRole := args[11].(string); assumeRole != "" {
+		credprov = stscreds.NewAssumeRoleProvider(sts.NewFromConfig(cfg), assumeRole)
+	}
+
 	return &proxy{
 		endpoint:        args[0].(string),
-		verbose:         args[1].(bool),
+		region:          cfg.Region,
+		verbose:         verbose,
 		prettify:        args[2].(bool),
 		logtofile:       args[3].(bool),
 		nosignreq:       args[4].(bool),
@@ -121,15 +148,15 @@ func newProxy(args ...interface{}) *proxy {
 		password:        args[8].(string),
 		realm:           args[9].(string),
 		remoteTerminate: args[10].(bool),
-		assumeRole:      args[11].(string),
+		signer:          v4.NewSigner(),
+		credProvider:    aws.NewCredentialsCache(credprov),
 	}
 }
 
 func (p *proxy) parseEndpoint() error {
 	var (
-		link          *url.URL
-		err           error
-		isAWSEndpoint bool
+		link *url.URL
+		err  error
 	)
 
 	if link, err = url.Parse(p.endpoint); err != nil {
@@ -158,79 +185,7 @@ func (p *proxy) parseEndpoint() error {
 	p.scheme = link.Scheme
 	p.host = link.Host
 
-	// AWS SignV4 enabled, extract required parts for signing process
-	if !p.nosignreq {
-
-		split := strings.SplitAfterN(link.Hostname(), ".", 2)
-
-		if len(split) < 2 {
-			logrus.Debugln("Endpoint split is less than 2")
-		}
-
-		awsEndpoints := []string{}
-		for _, partition := range endpoints.DefaultPartitions() {
-			for region := range partition.Regions() {
-				awsEndpoints = append(awsEndpoints, fmt.Sprintf("%s.es.%s", region, partition.DNSSuffix()))
-			}
-		}
-
-		isAWSEndpoint = false
-		for _, v := range awsEndpoints {
-			if split[1] == v {
-				logrus.Debugln("Provided endpoint is a valid AWS Elasticsearch endpoint")
-				isAWSEndpoint = true
-				break
-			}
-		}
-
-		if isAWSEndpoint {
-			// Extract region and service from link. This should be save now
-			parts := strings.Split(link.Host, ".")
-			p.region, p.service = parts[1], "es"
-			logrus.Debugln("AWS Region", p.region)
-		}
-	}
-
 	return nil
-}
-
-func (p *proxy) getSigner() *v4.Signer {
-	// Refresh credentials after expiration. Required for STS
-	if p.credentials == nil {
-		sess, err := session.NewSession(
-			&aws.Config{
-				Region:                        aws.String(p.region),
-				CredentialsChainVerboseErrors: aws.Bool(true),
-			},
-		)
-		if err != nil {
-			logrus.Debugln(err)
-		}
-
-		awsRoleARN := os.Getenv("AWS_ROLE_ARN")
-		awsWebIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
-
-		var creds *credentials.Credentials
-		if awsRoleARN != "" && awsWebIdentityTokenFile != "" {
-			logrus.Infof("Using web identity credentials with role %s", awsRoleARN)
-			creds = stscreds.NewWebIdentityCredentials(sess, awsRoleARN, "", awsWebIdentityTokenFile)
-		} else if p.assumeRole != "" {
-			logrus.Infof("Assuming credentials from %s", p.assumeRole)
-			creds = stscreds.NewCredentials(sess, p.assumeRole, func(provider *stscreds.AssumeRoleProvider) {
-				provider.Duration = 17 * time.Minute
-				provider.ExpiryWindow = 13 * time.Minute
-				provider.MaxJitterFrac = 0.1
-			})
-		} else {
-			logrus.Infoln("Using default credentials")
-			creds = sess.Config.Credentials
-		}
-
-		p.credentials = creds
-		logrus.Infoln("Generated fresh AWS Credentials object")
-	}
-
-	return v4.NewSigner(p.credentials)
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -238,6 +193,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		logrus.Infoln("Terminate Signal")
 		os.Exit(0)
 	}
+
+	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*60)
+	defer cancel()
 
 	if p.auth {
 		user, pass, ok := r.BasicAuth()
@@ -282,17 +240,42 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Make signV4 optional
 	if !p.nosignreq {
 		// Start AWS session from ENV, Shared Creds or EC2Role
-		signer := p.getSigner()
+		signer := v4.NewSigner()
+
+		creds, err := p.credProvider.Retrieve(ctx)
+		if err != nil {
+			logrus.Errorln("Failed to get AWS credentials", err)
+			http.Error(w, "Failed to sign", http.StatusInternalServerError)
+			return
+		}
+
+		logrus.Debugf("aws credentials, key = %s, source = %s, expire = %v", creds.AccessKeyID, creds.Source, creds.Expires)
 
 		// Sign the request with AWSv4
-		payload := bytes.NewReader(replaceBody(req))
-		_, err := signer.Sign(req, payload, p.service, p.region, time.Now())
+		payload, err := io.ReadAll(req.Body)
 		if err != nil {
-			p.credentials = nil
+			logrus.Errorln("Failed to read payload from incoming request", err)
+			http.Error(w, "Failed to sign", http.StatusInternalServerError)
+			return
+		}
+		sha := sha256.New()
+		sha.Write(payload)
+		hash := fmt.Sprintf("%x", sha.Sum(nil))
+
+		// SignHTTP(ctx context.Context, credentials aws.Credentials, r *http.Request, payloadHash string, service string, region string, signingTime time.Time, optFns ...func(options *SignerOptions)) error {
+		err = signer.SignHTTP(ctx, creds, req, hash, "es", p.region, time.Now(), func(options *v4.SignerOptions) {
+			options.Logger = newAwsLogger()
+			options.LogSigning = p.verbose
+		})
+
+		if err != nil {
 			logrus.Errorln("Failed to sign", err)
 			http.Error(w, "Failed to sign", http.StatusForbidden)
 			return
 		}
+
+		// reput body reader
+		req.Body = io.NopCloser(bytes.NewReader(payload))
 	}
 
 	resp, err := p.httpClient.Do(req)
@@ -305,8 +288,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !p.nosignreq {
 		// AWS credentials expired, need to generate fresh ones
 		if resp.StatusCode == 403 {
-			logrus.Errorln("Received 403 from AWSAuth, invalidating credentials for retrial")
-			p.credentials = nil
+			logrus.Errorln("Received 403 from AWSAuth, invalidating credentials for retrial, make sure if user has iam permission 'es:Http%s'", strings.Title(req.Method))
 
 			logrus.Debugln("Received Status code from AWS:", resp.StatusCode)
 			b := bytes.Buffer{}
@@ -339,8 +321,8 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	requestEnded := time.Since(requestStarted)
 
 	/*############################
-	## Logging
-	############################*/
+	  ## Logging
+	  ############################*/
 
 	rawQuery := string(dump)
 	rawQuery = strings.Replace(rawQuery, "\n", " ", -1)
@@ -568,4 +550,15 @@ func main() {
 
 	logrus.Infof("Listening on %s...\n", listenAddress)
 	logrus.Fatalln(http.ListenAndServe(listenAddress, p))
+}
+
+func newAwsLogger() logging.Logger {
+	return logging.LoggerFunc(func(classification logging.Classification, format string, v ...interface{}) {
+		switch classification {
+		case logging.Warn:
+			logrus.Warnf(format, v...)
+		case logging.Debug:
+			logrus.Debugf(format, v...)
+		}
+	})
 }

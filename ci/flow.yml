@@ -1,0 +1,8 @@
+type: simple
+version: 3.0.0
+
+maintainers:
+- name: SRE Team
+  email: sre@stingray.com
+- name: Alexandre Maari
+  email: amaari@stingray.com

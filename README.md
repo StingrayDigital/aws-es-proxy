@@ -1,10 +1,17 @@
 # aws-es-proxy
 
-[![Docker Pulls](https://img.shields.io/docker/pulls/abutaha/aws-es-proxy.svg)](https://hub.docker.com/r/abutaha/aws-es-proxy/)
-
-**aws-es-proxy** is a small web server application sitting between your HTTP client (browser, curl, etc...) and Amazon Elasticsearch service. It will sign your requests using latest [AWS Signature Version 4](http://docs.aws.amazon.com/general/latest/gr/signature-version-4.html) before sending the request to Amazon Elasticsearch. When response is back from Amazon Elasticsearch, this response will be sent back to your HTTP client.
+**aws-es-proxy** is a small web server application sitting between your HTTP client (browser, curl, etc...) and Amazon
+Elasticsearch service. It will sign your requests using
+latest [AWS Signature Version 4](http://docs.aws.amazon.com/general/latest/gr/signature-version-4.html) before sending
+the request to Amazon Elasticsearch. When response is back from Amazon Elasticsearch, this response will be sent back to
+your HTTP client.
 
 Kibana requests are also signed automatically.
+
+## Fork Notes
+
+This fork was create to update the AWS SDK and support for the standard credential loading mecanism and
+to integrate with our internal CI.
 
 ## Installation
 
